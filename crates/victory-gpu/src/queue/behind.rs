@@ -755,6 +755,19 @@ pub(super) fn leave() {
 }
 
 /// Starts the thread, once: whether there is one.
+/// Whether the submitting thread runs at the highest priority and the
+/// threads that do its work spread (`crate::shadow`'s wide workers) above
+/// normal (`VICTORY_SUBMIT_PRIORITY=high`; off: above normal, and normal).
+///
+/// On a CPU with fewer cores than the threads that want them (a 6-core
+/// Ryzen 5 5600X: 12 threads for the title's ~8 and some 25 of ours) the
+/// submitting thread sets the frame (59 of 64 ms) and waits for its wide
+/// workers, which took turns with the translating threads and the title's.
+pub(crate) fn submit_high() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SUBMIT_PRIORITY").is_ok_and(|v| v.trim() == "high"))
+}
+
 fn started() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -763,9 +776,12 @@ fn started() -> bool {
             return false;
         }
         let worker = || {
-            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+            use windows_sys::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST,
+            };
+            let priority = if submit_high() { THREAD_PRIORITY_HIGHEST } else { THREAD_PRIORITY_ABOVE_NORMAL };
             // SAFETY: this thread's own priority.
-            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+            unsafe { SetThreadPriority(GetCurrentThread(), priority) };
             crate::cores::keep_on_fast_cores("victory-submit");
             OURS.set(true);
             let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LANE.serve()));

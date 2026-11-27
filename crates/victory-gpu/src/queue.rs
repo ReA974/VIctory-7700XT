@@ -9,6 +9,8 @@ use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
 mod behind;
+#[cfg(windows)]
+pub(crate) use behind::submit_high;
 
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
