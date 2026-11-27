@@ -3219,16 +3219,27 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
     let mut places: ByCopy<Option<usize>> = ByCopy::default();
     let scanning = std::time::Instant::now();
+    // The copy of the step before and its place: a list's refreshes of one
+    // copy come one after another, so most steps need no look in `places`
+    // (as `refresh_front` does).
+    let mut last: (usize, Option<usize>) = (0, None);
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step {
-                let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
-                    shadow.writes_pending().then(|| {
-                        spans.push((shadow.clone(), *address, *address + *len));
-                        spans.len() - 1
-                    })
-                });
-                if let Some(i) = *place {
+                let key = Arc::as_ptr(shadow) as usize;
+                let place = if key == last.0 {
+                    last.1
+                } else {
+                    let place = *places.entry(key).or_insert_with(|| {
+                        shadow.writes_pending().then(|| {
+                            spans.push((shadow.clone(), *address, *address + *len));
+                            spans.len() - 1
+                        })
+                    });
+                    last = (key, place);
+                    place
+                };
+                if let Some(i) = place {
                     let s = &mut spans[i];
                     (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
                 }
