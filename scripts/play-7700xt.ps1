@@ -26,6 +26,8 @@
 # -Ambient     share of the stand-in for the ray-traced indirect light (default 1.0 = all of it)
 # -AmbientAir  bound on what the air of a room scatters, as a multiple of the light around (default 1.0;
 #              0 = the title's own)
+# -Cbv         renderer patch 5 (VICTORY_PORT_CBV): changes the shader cache key, so run `victory shaders`
+#              and `victory warm` with VICTORY_PORT_CBV=1 first (docs/7700xt.md), or the picture stays black
 # -AutoA       seconds during which the stand-in pad presses A by itself, through the menus and the intro's
 #              cutscene (default 300; 0: never). Needs a build with VICTORY_AUTO_A (gameinput.rs).
 # -Profile     VICTORY_PROFILE=<from s>,<to s>,<ms>,<file>: samples the busiest threads' stacks (diag build)
@@ -48,6 +50,7 @@ param(
     [string]$AmbientAir = '1.0',
     [string]$Profile = '',
     [int]$AutoA = 300,
+    [switch]$Cbv,
     [string]$Log,
     [hashtable]$More = @{}
 )
@@ -87,6 +90,7 @@ $settings.VICTORY_AMBIENT = $Ambient
 if ($AmbientAir -and $AmbientAir -ne '0') { $settings.VICTORY_AMBIENT_AIR = $AmbientAir }
 if ($Profile) { $settings.VICTORY_PROFILE = $Profile }
 if ($AutoA -gt 0) { $settings.VICTORY_AUTO_A = "$AutoA" }
+if ($Cbv) { $settings.VICTORY_PORT_CBV = '1' }
 # Thousands of log lines a second (frame statistics, renderer port 2's warnings) cost the threads that
 # write them: only errors, unless the run is a measurement (-Log, or the diag build).
 if (-not $Log -and $Build -eq 'release') { $settings.VICTORY_LOG = 'error' }
