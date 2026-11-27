@@ -17,6 +17,7 @@
 # -Log         also write the output to this file
 # -Output      output size the title renders to itself, e.g. 1920x1080 (with -SeriesX: the Series X
 #              picture at 1080p, sharper than Series S, about 16 ms less card time than its 4K)
+# -Profile     VICTORY_PROFILE=<from s>,<to s>,<ms>,<file>: samples the busiest threads' stacks (diag build)
 # -ThinThreads threads translating the title's list calls (default 8)
 # -BarMB       MB of console windows put in card memory the CPU writes directly (Resizable BAR / SAM must be on;
 #              measured: no gain on this PC)
@@ -30,6 +31,7 @@ param(
     [int]$BarMB = 0,
     [int]$ThinThreads = 8,
     [string]$Output = '',
+    [string]$Profile = '',
     [string]$Log,
     [hashtable]$More = @{}
 )
@@ -57,9 +59,11 @@ if (-not $Stock) {
 }
 if ($BarMB -gt 0) { $settings.VICTORY_WINDOWS_BAR_MB = "$BarMB" }
 if ($Output) { $settings.VICTORY_OUTPUT = $Output }
+if ($Profile) { $settings.VICTORY_PROFILE = $Profile }
 # Thousands of log lines a second (frame statistics, renderer port 2's warnings) cost the threads that
 # write them: only errors, unless the run is a measurement (-Log, or the diag build).
 if (-not $Log -and $Build -eq 'release') { $settings.VICTORY_LOG = 'error' }
+if ($Profile) { $settings.VICTORY_LOG = 'error' }   # the profile shows the port's costs, not the log's
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $root = Join-Path $PSScriptRoot '..'
