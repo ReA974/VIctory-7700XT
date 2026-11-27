@@ -3586,7 +3586,7 @@ impl State {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
-                let once = ready_once() && selected.is_empty() && !group.has_uav;
+                let once = ready_once() && selected.is_empty() && (!group.has_uav || ready_uav());
                 if once
                     && known.epoch == list.epoch()
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
@@ -3673,13 +3673,23 @@ impl State {
                         .entry(k)
                         .map(|u| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
-                    let was = (listed.ready, listed.tabled);
+                    let was = (listed.ready, listed.wrote, listed.tabled);
                     if let Some(kind) = kind {
                         let tested = TESTED_DEPTH.get();
+                        // Whether `readable` declares what shaders write
+                        // through unordered access.
+                        let writes = STORES.get() || !write_skip();
                         if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
                             if listed.ready.2 {
                                 TESTED_DEPTH.set((tested.0, true));
                             }
+                        } else if kind == ResourceType::Uav
+                            && ready_uav()
+                            && listed.wrote.0 == list.epoch()
+                            && (listed.wrote.1 || !writes)
+                        {
+                            // Made ready, and declared written if this reader
+                            // writes, with nothing changed in the list since.
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
                             TESTED_DEPTH.set((tested.0, false));
                             readable(list, kind, &view);
@@ -3687,6 +3697,8 @@ impl State {
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv {
                                 listed.ready = (list.epoch(), tested.0, depth);
+                            } else if kind == ResourceType::Uav {
+                                listed.wrote = (list.epoch(), writes);
                             }
                         }
                     }
@@ -3700,7 +3712,7 @@ impl State {
                             host.mirror_after(list, title + k, table + u64::from(k) * 32);
                         }
                     }
-                    if was != (listed.ready, listed.tabled) {
+                    if was != (listed.ready, listed.wrote, listed.tabled) {
                         crate::descriptor::host::note_listed(recording, words, listed);
                     }
                     continue;
@@ -4480,6 +4492,23 @@ struct FreshTable {
 /// through again at every draw).
 fn ready_once() -> bool {
     crate::toggled!("VICTORY_READY_ONCE")
+}
+
+/// Whether views of unordered access go by that too (`VICTORY_READY_UAV=0`:
+/// they are made ready at every draw and dispatch, as before).
+///
+/// What [`readable`] does for such a view is the same again while nothing
+/// changed in the list (its epoch, [`HostList::changed_something`]) and the
+/// reader is the same: the refresh and the declared write are each taken
+/// once per list until title memory is written (`HostList::defer_refresh`,
+/// `HostList::defer_gpu_write`), a texture already in the state stays
+/// there, a texture copied back is noted once, and the use of a depth
+/// texture's twin changes the epoch itself. A reader that does not store
+/// does not declare the write: one that does goes through again. The
+/// title's culling and lighting dispatches bind the same thirty views,
+/// unordered access among them, some 2,500 times in one recording.
+fn ready_uav() -> bool {
+    crate::toggled!("VICTORY_READY_UAV")
 }
 
 /// A hash of records' words: 64 bits, two multiplications a record. (The

@@ -2836,6 +2836,7 @@ impl HostHeap {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
                     ready: (0, 0, false),
+                    wrote: (0, false),
                     tabled: None,
                 };
                 views.made.insert(words, ListView { view, at, twin, kept, listed });
@@ -6086,6 +6087,9 @@ pub(crate) struct Listed {
     /// Read at this epoch of the list ([`crate::host::HostList::epoch`]) with
     /// this depth target tested: up to date; and whether it is that target's.
     pub(crate) ready: (u64, usize, bool),
+    /// Of unordered access: made ready at this epoch of the list, and whether
+    /// what shaders write through it was declared then (a reader that stores).
+    pub(crate) wrote: (u64, bool),
     /// The title's slot last noted for it, and whether the draw read it.
     pub(crate) tabled: Option<(u32, bool)>,
 }
