@@ -27,7 +27,7 @@
 # -AmbientAir  bound on what the air of a room scatters, as a multiple of the light around (default 1.0;
 #              0 = the title's own)
 # -Profile     VICTORY_PROFILE=<from s>,<to s>,<ms>,<file>: samples the busiest threads' stacks (diag build)
-# -ThinThreads threads translating the title's list calls (default 8)
+# -ThinThreads threads translating the title's list calls (default 6: one per core of a 5600X)
 # -BarMB       MB of console windows put in card memory the CPU writes directly (Resizable BAR / SAM must be on;
 #              measured: no gain on this PC)
 param(
@@ -39,7 +39,7 @@ param(
     [int]$CardMinMB = 1,
     [int]$CardMB = 1024,
     [int]$BarMB = 0,
-    [int]$ThinThreads = 8,
+    [int]$ThinThreads = 6,
     [string]$Output = '1920x1080',
     [string]$RenderScale = '1.0',
     [string]$Ambient = '1.0',
@@ -59,8 +59,9 @@ $settings = @{
     VICTORY_PIPELINE_BOOK = '1'
 }
 if (-not $Stock) {
-    # Defaults: THIN 8, UNDER 6, VIEW 6, LAND 3. The list calls' translation (THIN) is the wall once the
-    # buffers are on the card (41,000 calls, ~280 ms of work a frame): it keeps its 8 threads.
+    # Defaults: THIN 8, UNDER 6, VIEW 6, LAND 3, for a 24-thread CPU. The 5600X has 6 cores (12 threads)
+    # and the title runs some 8 threads of its own: with 8 translating threads they took turns on the
+    # cores. Prison scene, native 1080p, all pipelines warm: THIN 8 77 ms a frame, 6 65 ms, 5 66 ms.
     $settings.VICTORY_THIN_THREADS = "$ThinThreads"
     $settings.VICTORY_UNDER_THREADS = '4'
     $settings.VICTORY_VIEW_THREADS = '4'
