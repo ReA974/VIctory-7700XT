@@ -60,6 +60,10 @@ $settings = @{
     VICTORY_PORT_CONSTANTS = '1'; VICTORY_PORT_DESCRIPTORS = '1'; VICTORY_PORT_GUARD = '1'; VICTORY_PORT_JOURNAL = '1'
     # Every pipeline the title creates is written down, so `victory warm` can make them ahead of a run.
     VICTORY_PIPELINE_BOOK = '1'
+    # Landed host lists reset and retired objects dropped on a thread of their own, off the submitting
+    # thread (Grimkaaah's VICTORY_REAPER; here 61.0 / 72.6 ms against 62.3, the 72.6 run with streaming
+    # spikes: at worst no loss).
+    VICTORY_REAPER = '1'
 }
 if (-not $Stock) {
     # Defaults: THIN 8, UNDER 6, VIEW 6, LAND 3, for a 24-thread CPU. The 5600X has 6 cores (12 threads)
