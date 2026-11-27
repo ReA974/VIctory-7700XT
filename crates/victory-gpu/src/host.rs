@@ -638,6 +638,13 @@ fn bury(finished: u64) {
     }
 }
 
+/// `VICTORY_LAND_NONE=1`: nothing shaders wrote is landed (a measurement of
+/// the most landing on demand could save; see `Host::relay_land`).
+fn land_none() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_NONE").is_some_and(|v| v == "1"))
+}
+
 /// Whether what the host is done with is let go of on a thread of its own
 /// ([`reaper`]; `VICTORY_REAPER=1`, off by default).
 fn reaping() -> bool {
@@ -5210,15 +5217,21 @@ impl Host {
                     }
                 }
                 let mut hand_back = relay_hand_back(&back);
-                stage.next("landing: copies in the card's memory");
-                self.relay_card_back(&plans, fetch, &mut || {
-                    if crate::land::on() {
-                        let _looking = crate::timeline::span("landing: looking through copies, beside the fetch");
-                        hand_back.look(crate::land::stat::SCAN_BESIDE);
-                    }
-                });
-                stage.next("landing: copies in the PC's memory");
-                hand_back.merge();
+                // `VICTORY_LAND_NONE=1`, a measurement only: what shaders
+                // wrote is not brought back to title memory at all (the
+                // title's CPU reads stale bytes: physics may go wrong). It
+                // gives the most landing on demand could save.
+                if !land_none() {
+                    stage.next("landing: copies in the card's memory");
+                    self.relay_card_back(&plans, fetch, &mut || {
+                        if crate::land::on() {
+                            let _looking = crate::timeline::span("landing: looking through copies, beside the fetch");
+                            hand_back.look(crate::land::stat::SCAN_BESIDE);
+                        }
+                    });
+                    stage.next("landing: copies in the PC's memory");
+                    hand_back.merge();
+                }
                 stage.next("landing: ranges done with");
                 let finishing = std::time::Instant::now();
                 // Only now, and flight by flight: a range another flight
