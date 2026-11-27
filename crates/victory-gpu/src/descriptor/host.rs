@@ -170,6 +170,9 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<Held>>]>,
+    /// This heap among all made in the run (from 1): whose chunk of dynamic
+    /// slots a thread holds ([`HostHeap::dynamic`]).
+    id: u64,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1605,6 +1608,16 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Dynamic slots a recording thread takes at once, for tables of up to a
+/// quarter of that ([`HostHeap::dynamic`]): eight threads hold 3 % of the
+/// slots at most, a table of a dispatch takes some thirty.
+const DYNAMIC_CHUNK: u32 = 1024;
+
+/// See [`HostHeap::dynamic`]. (Not in tests, which ask for slots by place.)
+fn dynamic_chunks() -> bool {
+    !cfg!(test) && crate::toggled!("VICTORY_DYNAMIC_CHUNKS")
+}
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
@@ -1750,6 +1763,10 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            id: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1859,14 +1876,60 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
+    ///
+    /// A short run comes out of a chunk of slots this thread took
+    /// ([`DYNAMIC_CHUNK`]), without the heap's lock: one lock for all eight
+    /// recording threads, taken for every table made afresh, was 72 % of the
+    /// time spent here, waiting (profile prof1, the prison). The chunk's
+    /// slots are taken in the heap's own count from the start, so a run cut
+    /// from it is given back as any other ([`HostHeap::release`]), and what
+    /// is left of it goes back when the thread takes the next.
+    /// `VICTORY_DYNAMIC_CHUNKS=0`: every run is searched under the lock.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
         #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        if n > DYNAMIC_CHUNK / 4 || self.dynamic < 64 * DYNAMIC_CHUNK || !dynamic_chunks() {
+            return self.take_run(n);
+        }
+        // (heap, next slot, end) by heap, for a few heaps.
+        thread_local! {
+            static CHUNKS: std::cell::RefCell<[(u64, u32, u32); 4]> = const { std::cell::RefCell::new([(0, 0, 0); 4]) };
+        }
+        CHUNKS.with_borrow_mut(|chunks| {
+            let mine = chunks.iter().position(|c| c.0 == self.id);
+            if let Some(i) = mine {
+                let (_, at, end) = chunks[i];
+                if end - at >= n {
+                    chunks[i].1 = at + n;
+                    return Some(at);
+                }
+                chunks[i] = (0, 0, 0);
+                if end > at {
+                    self.release(at, end - at);
+                }
+            }
+            let Some(room) = mine.or_else(|| chunks.iter().position(|c| c.0 == 0)) else {
+                // Chunks of other heaps in every place: as before.
+                return self.take_run(n);
+            };
+            match self.take_run(DYNAMIC_CHUNK) {
+                Some(first) => {
+                    chunks[room] = (self.id, first + n, first + DYNAMIC_CHUNK);
+                    Some(first)
+                }
+                // No such run free (slots held in pieces): the run alone.
+                None => self.take_run(n),
+            }
+        })
+    }
+
+    /// [`HostHeap::dynamic`], searched under the heap's lock.
+    fn take_run(&self, n: u32) -> Option<u32> {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
