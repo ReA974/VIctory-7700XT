@@ -169,7 +169,7 @@ pub(crate) struct HostHeap {
     /// A lock for each slot: one for the heap was what the recording threads
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
-    kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    kept: Box<[Mutex<Option<Held>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -2831,7 +2831,7 @@ impl HostHeap {
                     return None;
                 }
                 let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?.map(Pin::new);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
@@ -2848,7 +2848,15 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.keep(index, made.kept.clone());
+            // (`VICTORY_SLOT_PINS=0`: each slot counts the resource itself.)
+            let held = made.kept.as_ref().map(|pin| {
+                if crate::toggled!("VICTORY_SLOT_PINS") {
+                    Held::Pin(pin.clone())
+                } else {
+                    Held::Resource((*pin.0).clone())
+                }
+            });
+            self.keep_held(index, held);
             Some(made.listed)
         })
     }
@@ -2906,28 +2914,34 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.keep_held(index, resource.map(Held::Resource));
+    }
+
+    /// [`HostHeap::keep`], with what holds the resource.
+    fn keep_held(&self, index: u32, held: Option<Held>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
         let old = {
-            use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            if slot.as_ref().map(Held::raw) == held.as_ref().map(Held::raw) {
                 return;
             }
-            std::mem::replace(&mut *slot, resource)
+            std::mem::replace(&mut *slot, held)
         };
         // A running submission may still read the old resource through
-        // this slot.
-        if let Some(old) = old {
-            crate::host::retire_resource(old);
+        // this slot. (A pin retires it when nothing holds the pin any more.)
+        match old {
+            Some(Held::Resource(old)) => crate::host::retire_resource(old),
+            Some(Held::Pin(pin)) => drop(pin),
+            None => {}
         }
     }
 
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
-        self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|h| h.resource().clone())
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -6081,8 +6095,55 @@ struct ListView {
     /// Its descriptor's slot in [`ListViews`]; its raw twin's is the next.
     at: u32,
     twin: bool,
-    kept: Kept,
+    /// What it shows, for the slots made from it to hold.
+    kept: Option<std::sync::Arc<Pin>>,
     listed: Listed,
+}
+
+/// What a slot of a host heap holds of the resource it shows
+/// ([`HostHeap::kept`]).
+enum Held {
+    Resource(ID3D12Resource),
+    /// Shared by the slots made from one view of a list's ([`ListViews`]).
+    Pin(std::sync::Arc<Pin>),
+}
+
+impl Held {
+    fn resource(&self) -> &ID3D12Resource {
+        match self {
+            Held::Resource(r) => r,
+            Held::Pin(pin) => &pin.0,
+        }
+    }
+
+    fn raw(&self) -> *mut std::ffi::c_void {
+        windows::core::Interface::as_raw(self.resource())
+    }
+}
+
+/// A host resource that slots made from one view of a list hold together
+/// (each slot a count of the pin's own), retired when the last lets go.
+///
+/// Each of those slots held the resource itself before, by a count of the
+/// runtime's (`AddRef`): the same few resources (the title's big buffers)
+/// counted up by the eight recording threads at once, 6 % of their time
+/// (profile prof1, the prison). A pin is made by the thread that records
+/// and counted on that thread's core.
+pub(crate) struct Pin(std::mem::ManuallyDrop<ID3D12Resource>);
+
+impl Pin {
+    fn new(resource: ID3D12Resource) -> std::sync::Arc<Pin> {
+        std::sync::Arc::new(Pin(std::mem::ManuallyDrop::new(resource)))
+    }
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        // SAFETY: taken once, here.
+        let resource = unsafe { std::mem::ManuallyDrop::take(&mut self.0) };
+        // A running submission may still read it through a slot that showed it.
+        crate::host::retire_resource(resource);
+    }
 }
 
 /// The descriptors a thread made for one recording of a list, by the record
