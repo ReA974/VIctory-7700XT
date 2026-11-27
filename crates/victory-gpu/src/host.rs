@@ -7820,9 +7820,21 @@ impl std::hash::Hasher for AddressHash {
     fn finish(&self) -> u64 {
         self.0
     }
+    /// Eight bytes a step: keys of words (a record's three, a description's
+    /// fourteen) come here as bytes, and one step a byte was 2.7 % of the
+    /// recording threads' time (profile prof1, the prison).
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_usize(usize::from(b));
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(word);
+            self.write_u64(u64::from_le_bytes(w));
+        }
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut w = [0u8; 8];
+            w[..rest.len()].copy_from_slice(rest);
+            self.write_u64(u64::from_le_bytes(w) ^ (rest.len() as u64) << 56);
         }
     }
     fn write_usize(&mut self, n: usize) {

@@ -3130,8 +3130,43 @@ pub(crate) fn texture_held(resource: This) -> Option<(u32, crate::texture::Diges
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
+///
+/// Asked for every view of a placed texture a draw reads, from the eight
+/// recording threads at once: [`PLACED_TEXTURES`]'s lock (and, for a view
+/// with filler words, [`PLACED_RAW`]'s) and two tree searches each time were
+/// 9 % of those threads' time, half of it waiting for the lock (profile
+/// prof1, the prison). An answer once given stays true for the run (the
+/// table only grows), so each thread remembers the ones it had, by the ask
+/// as made: an ask this thread made before was counted in `PLACED_RAW`
+/// already. `VICTORY_PLACED_QUICK=0`: every ask takes the lock, as before.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    // Asks a thread remembers before it forgets them all (some 70 bytes
+    // each).
+    const MOST: usize = 1 << 16;
+    type Known = std::collections::HashMap<(u64, [u32; 14]), usize, std::hash::BuildHasherDefault<crate::host::AddressHash>>;
+    thread_local! {
+        static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::new(Known::default());
+    }
+    if !crate::toggled!("VICTORY_PLACED_QUICK") {
+        return texture_at_locked(address, desc);
+    }
+    if let Some(r) = KNOWN.with_borrow(|known| known.get(&(address, *desc)).copied()) {
+        return Some(r as This);
+    }
+    let r = texture_at_locked(address, desc)?;
+    KNOWN.with_borrow_mut(|known| {
+        if known.len() >= MOST {
+            known.clear();
+        }
+        known.insert((address, *desc), r as usize);
+    });
+    Some(r)
+}
+
+/// [`texture_at`] under the table's lock.
+#[cfg(windows)]
+fn texture_at_locked(address: u64, desc: &[u32; 14]) -> Option<This> {
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in
