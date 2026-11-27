@@ -3032,17 +3032,25 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(&key, s)| {
-                (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
-            })
-            .collect();
+        let idle = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| -> Vec<(u64, (u64, u64), usize, u64)> {
+            map.iter()
+                .filter(|(_, s)| {
+                    Arc::strong_count(s) == 1
+                        && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                        && crate::host::references(&s.buffer) == 1
+                })
+                .map(|(&key, s)| (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len))
+                .collect()
+        };
+        // Threads hand out windows they remember without this lock
+        // ([`LOOSE_CHANGED`]): counted before the look that lets go, and
+        // only when there is something to let go (this runs before every
+        // submission).
+        if idle(&map).is_empty() {
+            return;
+        }
+        LOOSE_CHANGED.fetch_add(1, Ordering::SeqCst);
+        let mut eligible = idle(&map);
         eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
         let victims = if keep == u64::MAX {
             (0..eligible.len()).collect()
@@ -5052,9 +5060,19 @@ static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 /// Answers a thread remembers.
 const FOUND_MOST: usize = 1024;
 
-/// An ask (address, bytes), the count of changes it was answered at, and the
-/// answer.
-type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
+/// How often a window was let go from [`LOOSE`], or was about to be: what
+/// threads remember of windows ([`FOUND`]) is of before. Counted when the
+/// map is taken to let windows go, before it is looked at, as
+/// [`BUFFERS_CHANGED`] is: a thread that takes a window it remembered
+/// either counted before (and does not hand it out) or holds it when the
+/// map is looked at (and it is not let go). A window made does not change
+/// what an ask on the default grid is answered.
+static LOOSE_CHANGED: AtomicU64 = AtomicU64::new(1);
+
+/// An ask (address, bytes), the count of changes it was answered at, the
+/// count of windows let go at that time if the answer is a window outside
+/// buffers (0: a buffer's copy), and the answer.
+type Found = (u64, u64, u64, u64, std::sync::Weak<Shadow>);
 
 thread_local! {
     /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
@@ -5077,26 +5095,45 @@ fn found_at(address: u64, len: u64) -> usize {
 /// What this thread remembers of an ask, if nothing changed since.
 fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
-    let shadow = FOUND.with(|f| {
+    let let_go = LOOSE_CHANGED.load(Ordering::SeqCst);
+    let (shadow, window) = FOUND.with(|f| {
         let f = f.borrow();
-        let (a, n, at, shadow) = f.get(found_at(address, len))?;
-        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+        let (a, n, at, window, shadow) = f.get(found_at(address, len))?;
+        let same = (*a, *n, *at) == (address, len, changed) && (*window == 0 || *window == let_go);
+        same.then(|| shadow.upgrade().map(|s| (s, *window != 0))).flatten()
     })?;
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    let still = BUFFERS_CHANGED.load(Ordering::SeqCst) == changed && (!window || LOOSE_CHANGED.load(Ordering::SeqCst) == let_go);
+    if !still {
+        return None;
+    }
+    if window {
+        noted(&shadow, address, address + len.max(1), len <= 1);
+    }
+    Some(shadow)
 }
 
-/// Remembers an answer given while `changed` was the count.
-fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
+/// Remembers an answer given while `changed` was the count (and `let_go`
+/// that of windows let go, for a window; else 0).
+fn remember(address: u64, len: u64, (changed, let_go): (u64, u64), shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+            f.resize_with(FOUND_MOST, || (0, 0, 0, 0, std::sync::Weak::new()));
         }
-        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
+        f[found_at(address, len)] = (address, len, changed, let_go, Arc::downgrade(shadow));
     });
+}
+
+/// Whether windows outside buffers are remembered too (`VICTORY_QUICK_LOOSE=0`:
+/// only buffers' copies, as before). An ask outside buffers was never
+/// remembered: each went through the buffers' map (64 of its nodes, from
+/// the ask down) and then the windows' map, 10 % of the recording threads'
+/// time with the look-up of buffers (profile prof1, the prison).
+fn quick_loose() -> bool {
+    crate::toggled!("VICTORY_QUICK_LOOSE")
 }
 
 fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
@@ -5140,6 +5177,8 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        // (What threads remember of windows is of before: [`LOOSE_CHANGED`].)
+        LOOSE_CHANGED.fetch_add(1, Ordering::SeqCst);
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
@@ -5218,20 +5257,28 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     }
     let end = address.checked_add(len.max(1))?;
     {
+        // (Before the look: a window let go meanwhile is not remembered.)
+        let let_go = LOOSE_CHANGED.load(Ordering::SeqCst);
         let map = buffers_read();
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             // The copy is made already (nearly always).
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
                     // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    remember(address, len, (BUFFERS_CHANGED.load(Ordering::SeqCst), 0), shadow);
                 }
                 return Some(shadow.clone());
             }
             Some(_) => {}
             None => {
+                let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                let shadow = loose(address, end, len <= 1, any)?;
+                // On the default grid the window is named by the ask alone.
+                if quick && quick_loose() && !fine() {
+                    remember(address, len, (changed, let_go), &shadow);
+                }
+                return Some(shadow);
             }
         }
     }
@@ -5532,26 +5579,30 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+/// A window is handed out for an ask of `[address, end)`: when it was last
+/// used (what [`let_go_idle`] goes by), what was asked of it.
+fn noted(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
+    // (Read first: the lines are shared by all recording threads.)
+    let now = crate::host::moment();
+    if shadow.used.load(Ordering::Relaxed) != now {
+        shadow.used.store(now, Ordering::Relaxed);
+    }
+    if shadow.asked[0].load(Ordering::Relaxed) > address {
+        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    }
+    if shadow.asked[1].load(Ordering::Relaxed) < end {
+        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    }
+    if unsized_ask {
+        shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        // (Read first: the lines are shared by all recording threads.)
-        let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
-            shadow.used.store(now, Ordering::Relaxed);
-        }
-        if shadow.asked[0].load(Ordering::Relaxed) > address {
-            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        }
-        if shadow.asked[1].load(Ordering::Relaxed) < end {
-            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        }
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
+    let note = |shadow: &Shadow| noted(shadow, address, end, unsized_ask);
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
