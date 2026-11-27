@@ -163,6 +163,24 @@ fn one_pad() -> bool {
     std::env::var_os("VICTORY_ONE_PAD").is_none_or(|v| v != "0")
 }
 
+/// `VICTORY_AUTO_A=<seconds>`: for that long from the first poll the stand-in
+/// pad presses A by itself, a tap every 2 s and a 2 s hold every 10 s, so that
+/// a run goes through the title's menus and skips the intro's cutscene with
+/// nobody at the controls (and whatever window has the focus: the keyboard is
+/// read only while the title's has it). Unset or 0: never.
+fn auto_a(first: &mut Option<Instant>) -> u32 {
+    static SECONDS: LazyLock<f64> = LazyLock::new(|| {
+        std::env::var("VICTORY_AUTO_A").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s > 0.0).unwrap_or(0.0)
+    });
+    if *SECONDS == 0.0 {
+        return 0;
+    }
+    let t = first.get_or_insert_with(Instant::now).elapsed().as_secs_f64();
+    let held = t % 10.0 >= 8.0;
+    let tapped = t % 2.0 < 0.15;
+    if t < *SECONDS && (held || tapped) { A } else { 0 }
+}
+
 #[repr(C)]
 struct Table<const N: usize>([*const (); N]);
 // SAFETY: function addresses only.
@@ -351,6 +369,8 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// The first poll, for [`auto_a`].
+    auto_since: Option<Instant>,
 }
 
 pub struct Hub {
@@ -398,6 +418,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                auto_since: None,
             }),
             returned: Condvar::new(),
         }));
@@ -484,8 +505,10 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let auto = auto_a(&mut self.auto_since);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let mut pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            pad.buttons |= auto;
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -494,7 +517,11 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| {
+            let mut pad = fallback(&keys);
+            pad.buttons |= auto;
+            Value::Pad(pad)
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events

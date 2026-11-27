@@ -26,6 +26,8 @@
 # -Ambient     share of the stand-in for the ray-traced indirect light (default 1.0 = all of it)
 # -AmbientAir  bound on what the air of a room scatters, as a multiple of the light around (default 1.0;
 #              0 = the title's own)
+# -AutoA       seconds during which the stand-in pad presses A by itself, through the menus and the intro's
+#              cutscene (default 300; 0: never). Needs a build with VICTORY_AUTO_A (gameinput.rs).
 # -Profile     VICTORY_PROFILE=<from s>,<to s>,<ms>,<file>: samples the busiest threads' stacks (diag build)
 # -ThinThreads threads translating the title's list calls (default 6: one per core of a 5600X)
 # -BarMB       MB of console windows put in card memory the CPU writes directly (Resizable BAR / SAM must be on;
@@ -45,6 +47,7 @@ param(
     [string]$Ambient = '1.0',
     [string]$AmbientAir = '1.0',
     [string]$Profile = '',
+    [int]$AutoA = 300,
     [string]$Log,
     [hashtable]$More = @{}
 )
@@ -79,6 +82,7 @@ if (-not $SeriesS) {
 $settings.VICTORY_AMBIENT = $Ambient
 if ($AmbientAir -and $AmbientAir -ne '0') { $settings.VICTORY_AMBIENT_AIR = $AmbientAir }
 if ($Profile) { $settings.VICTORY_PROFILE = $Profile }
+if ($AutoA -gt 0) { $settings.VICTORY_AUTO_A = "$AutoA" }
 # Thousands of log lines a second (frame statistics, renderer port 2's warnings) cost the threads that
 # write them: only errors, unless the run is a measurement (-Log, or the diag build).
 if (-not $Log -and $Build -eq 'release') { $settings.VICTORY_LOG = 'error' }

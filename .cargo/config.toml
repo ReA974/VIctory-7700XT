@@ -1,2 +1,10 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# Code generation for the machine this fork is played on: a Ryzen 5 5600X (Zen 3). Without it rustc
+# targets the x86-64 baseline (SSE2 only), and every hash, compare, search and copy the translator does
+# tens of thousands of times a frame is built without AVX2, BMI1/2, LZCNT/TZCNT, POPCNT or FMA; only a
+# few hand-written routines picked AVX2 at run time. A build made with this does not run on a CPU
+# without those instructions: remove these lines (or set RUSTFLAGS) to build for another machine.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=znver3"]
